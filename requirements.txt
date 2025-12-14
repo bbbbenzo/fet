@@ -1,5 +1,2 @@
-{
-  "deploy": {
-    "startCommand": "python bot.py"
-  }
-}
+pyTelegramBotAPI==4.19.1
+psycopg2-binary==2.9.9  # если используете PostgreSQL
