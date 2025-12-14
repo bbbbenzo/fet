@@ -16,7 +16,7 @@ db_lock = threading.Lock()
 apihelper.proxy = None
 
 # Настройки бота
-BOT_TOKEN = "8570287773:AAEfRXTJh056C2ls2BnH-bN5jZPXp3kR4NQ"
+BOT_TOKEN = "8183458500:AAGQmjvSw0mg6EeWmmh8Ak5Y0FSgHf--YUI"
 ADMIN_CHAT_ID = "7529123320"
 MEDIA_CHANNEL_ID = "-1003354824243"
 CACHE_DIR = 'media_cache'  # Название папки
@@ -3953,3 +3953,4 @@ if __name__ == "__main__":
         bot.infinity_polling()
     except Exception as e:
         print(f"Bot error: {e}")
+
