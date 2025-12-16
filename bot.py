@@ -1,11 +1,11 @@
 import asyncio
 import logging
-import sqlite3
 import os
 import time
 from datetime import datetime
 from typing import Optional, Dict
-from contextlib import contextmanager
+import asyncpg
+from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
@@ -76,168 +76,173 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(','))) if os.getenv("ADMIN_IDS") else []
 
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ POSTGRESQL ==========
 class AppleDatabase:
-    """База данных в стиле Apple — минималистичная и эффективная"""
+    """База данных PostgreSQL для Railway"""
 
-    def __init__(self, db_name="anonchat.db"):
-        self.db_name = db_name
-        self._init_database()
+    def __init__(self):
+        self.dsn = os.getenv("DATABASE_URL")
+        self.pool = None
 
-    @contextmanager
-    def _connection(self):
-        """Элегантное управление подключениями"""
-        conn = sqlite3.connect(self.db_name)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+    async def init(self):
+        """Инициализация подключения и создание таблиц"""
+        if not self.dsn:
+            logging.error("❌ DATABASE_URL не найден в переменных окружения")
+            return False
+
         try:
-            yield conn
-            conn.commit()
+            self.pool = await asyncpg.create_pool(
+                dsn=self.dsn,
+                min_size=1,
+                max_size=10,
+                command_timeout=60
+            )
+            await self._init_tables()
+            logging.info("✅ PostgreSQL база данных инициализирована")
+            return True
         except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            conn.close()
+            logging.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+            return False
 
-    def _init_database(self):
-        """Инициализация структуры базы данных"""
-        with self._connection() as conn:
+    @asynccontextmanager
+    async def _get_connection(self):
+        """Асинхронный контекстный менеджер для подключений"""
+        async with self.pool.acquire() as connection:
+            yield connection
+
+    async def _init_tables(self):
+        """Создание таблиц в PostgreSQL"""
+        async with self._get_connection() as conn:
             # Пользователи
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER UNIQUE NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE NOT NULL,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     message_count INTEGER DEFAULT 0,
                     session_count INTEGER DEFAULT 0,
-                    is_active BOOLEAN DEFAULT 1,
+                    is_active BOOLEAN DEFAULT TRUE,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
             # Сессии чатов
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user1_id INTEGER NOT NULL,
-                    user2_id INTEGER NOT NULL,
+                    id SERIAL PRIMARY KEY,
+                    user1_id INTEGER NOT NULL REFERENCES users(id),
+                    user2_id INTEGER NOT NULL REFERENCES users(id),
                     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     ended_at TIMESTAMP,
-                    message_count INTEGER DEFAULT 0,
-                    FOREIGN KEY (user1_id) REFERENCES users(id),
-                    FOREIGN KEY (user2_id) REFERENCES users(id)
+                    message_count INTEGER DEFAULT 0
                 )
             """)
 
-            # Активные соединения (используем telegram_id для быстрого доступа)
-            conn.execute("""
+            # Активные соединения
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS active_connections (
-                    telegram_id INTEGER PRIMARY KEY,
-                    partner_telegram_id INTEGER NOT NULL,
-                    session_id INTEGER NOT NULL,
+                    telegram_id BIGINT PRIMARY KEY,
+                    partner_telegram_id BIGINT NOT NULL,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
             # Поисковые очереди
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS search_queue (
-                    telegram_id INTEGER PRIMARY KEY,
+                    telegram_id BIGINT PRIMARY KEY,
                     joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
-    def create_or_update_user(self, telegram_id: int, username: str, first_name: str) -> dict:
+    async def create_or_update_user(self, telegram_id: int, username: str, first_name: str) -> dict:
         """Создание или обновление пользователя"""
-        with self._connection() as conn:
+        async with self._get_connection() as conn:
             # Проверяем существование
-            cursor = conn.execute(
-                "SELECT * FROM users WHERE telegram_id = ?",
-                (telegram_id,)
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id
             )
-            user = cursor.fetchone()
 
             if user:
                 # Обновляем
-                conn.execute("""
+                await conn.execute("""
                     UPDATE users 
-                    SET username = ?, first_name = ?, updated_at = CURRENT_TIMESTAMP, last_seen = CURRENT_TIMESTAMP
-                    WHERE telegram_id = ?
-                """, (username, first_name, telegram_id))
-                cursor = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-                return dict(cursor.fetchone())
+                    SET username = $1, first_name = $2, updated_at = CURRENT_TIMESTAMP, last_seen = CURRENT_TIMESTAMP
+                    WHERE telegram_id = $3
+                """, username, first_name, telegram_id)
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
             else:
                 # Создаем нового
-                cursor = conn.execute("""
+                await conn.execute("""
                     INSERT INTO users (telegram_id, username, first_name) 
-                    VALUES (?, ?, ?)
-                """, (telegram_id, username, first_name))
-                cursor = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-                return dict(cursor.fetchone())
+                    VALUES ($1, $2, $3)
+                """, telegram_id, username, first_name)
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
 
-    def join_search_queue(self, telegram_id: int) -> bool:
+            return dict(user) if user else {}
+
+    async def join_search_queue(self, telegram_id: int) -> bool:
         """Добавление в очередь поиска"""
-        with self._connection() as conn:
+        async with self._get_connection() as conn:
             # Проверяем, не в поиске ли уже
-            cursor = conn.execute(
-                "SELECT * FROM search_queue WHERE telegram_id = ?",
-                (telegram_id,)
+            in_queue = await conn.fetchrow(
+                "SELECT * FROM search_queue WHERE telegram_id = $1",
+                telegram_id
             )
-            if cursor.fetchone():
+            if in_queue:
                 return False
 
             # Проверяем, не в активном чате ли
-            cursor = conn.execute(
-                "SELECT * FROM active_connections WHERE telegram_id = ?",
-                (telegram_id,)
+            in_chat = await conn.fetchrow(
+                "SELECT * FROM active_connections WHERE telegram_id = $1",
+                telegram_id
             )
-            if cursor.fetchone():
+            if in_chat:
                 return False
 
             # Добавляем в очередь
-            conn.execute(
-                "INSERT INTO search_queue (telegram_id) VALUES (?)",
-                (telegram_id,)
+            await conn.execute(
+                "INSERT INTO search_queue (telegram_id) VALUES ($1)",
+                telegram_id
             )
             return True
 
-    def leave_search_queue(self, telegram_id: int) -> bool:
+    async def leave_search_queue(self, telegram_id: int) -> bool:
         """Выход из очереди поиска"""
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM search_queue WHERE telegram_id = ?",
-                (telegram_id,)
+        async with self._get_connection() as conn:
+            result = await conn.execute(
+                "DELETE FROM search_queue WHERE telegram_id = $1",
+                telegram_id
             )
-            return cursor.rowcount > 0
+            return "DELETE 1" in result
 
-    def find_partner(self, telegram_id: int) -> Optional[int]:
+    async def find_partner(self, telegram_id: int) -> Optional[int]:
         """Поиск партнера для чата"""
-        with self._connection() as conn:
+        async with self._get_connection() as conn:
             # Ищем другого пользователя в очереди
-            cursor = conn.execute("""
+            partner = await conn.fetchrow("""
                 SELECT telegram_id FROM search_queue 
-                WHERE telegram_id != ? 
+                WHERE telegram_id != $1 
                 ORDER BY joined_at 
                 LIMIT 1
-            """, (telegram_id,))
+            """, telegram_id)
 
-            partner = cursor.fetchone()
             if not partner:
                 return None
 
             partner_telegram_id = partner['telegram_id']
 
             # Получаем ID пользователей из таблицы users
-            cursor = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-            user = cursor.fetchone()
+            user = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
             if not user:
                 return None
 
-            cursor = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (partner_telegram_id,))
-            partner_user = cursor.fetchone()
+            partner_user = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", partner_telegram_id)
             if not partner_user:
                 return None
 
@@ -245,49 +250,56 @@ class AppleDatabase:
             partner_id = partner_user['id']
 
             # Удаляем обоих из очереди
-            conn.execute("DELETE FROM search_queue WHERE telegram_id IN (?, ?)",
-                         (telegram_id, partner_telegram_id))
+            await conn.execute("DELETE FROM search_queue WHERE telegram_id IN ($1, $2)",
+                               telegram_id, partner_telegram_id)
 
             # Создаем сессию
-            cursor = conn.execute("""
+            session = await conn.fetchrow("""
                 INSERT INTO sessions (user1_id, user2_id) 
-                VALUES (?, ?)
-            """, (user_id, partner_id))
-            session_id = cursor.lastrowid
+                VALUES ($1, $2)
+                RETURNING id
+            """, user_id, partner_id)
+            session_id = session['id']
 
             # Создаем активные соединения
-            conn.execute("""
-                INSERT OR REPLACE INTO active_connections (telegram_id, partner_telegram_id, session_id) 
-                VALUES (?, ?, ?)
-            """, (telegram_id, partner_telegram_id, session_id))
+            await conn.execute("""
+                INSERT INTO active_connections (telegram_id, partner_telegram_id, session_id) 
+                VALUES ($1, $2, $3)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                partner_telegram_id = $2,
+                session_id = $3,
+                created_at = CURRENT_TIMESTAMP
+            """, telegram_id, partner_telegram_id, session_id)
 
-            conn.execute("""
-                INSERT OR REPLACE INTO active_connections (telegram_id, partner_telegram_id, session_id) 
-                VALUES (?, ?, ?)
-            """, (partner_telegram_id, telegram_id, session_id))
+            await conn.execute("""
+                INSERT INTO active_connections (telegram_id, partner_telegram_id, session_id) 
+                VALUES ($1, $2, $3)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                partner_telegram_id = $2,
+                session_id = $3,
+                created_at = CURRENT_TIMESTAMP
+            """, partner_telegram_id, telegram_id, session_id)
 
             return partner_telegram_id
 
-    def get_active_partner(self, telegram_id: int) -> Optional[int]:
+    async def get_active_partner(self, telegram_id: int) -> Optional[int]:
         """Получение активного партнера"""
-        with self._connection() as conn:
-            cursor = conn.execute("""
+        async with self._get_connection() as conn:
+            result = await conn.fetchrow("""
                 SELECT partner_telegram_id FROM active_connections 
-                WHERE telegram_id = ?
-            """, (telegram_id,))
-            result = cursor.fetchone()
+                WHERE telegram_id = $1
+            """, telegram_id)
             return result['partner_telegram_id'] if result else None
 
-    def end_session(self, telegram_id: int) -> Optional[int]:
+    async def end_session(self, telegram_id: int) -> Optional[int]:
         """Завершение сессии"""
-        with self._connection() as conn:
+        async with self._get_connection() as conn:
             # Получаем партнера и сессию
-            cursor = conn.execute("""
+            result = await conn.fetchrow("""
                 SELECT partner_telegram_id, session_id FROM active_connections 
-                WHERE telegram_id = ?
-            """, (telegram_id,))
+                WHERE telegram_id = $1
+            """, telegram_id)
 
-            result = cursor.fetchone()
             if not result:
                 return None
 
@@ -295,93 +307,82 @@ class AppleDatabase:
             session_id = result['session_id']
 
             # Получаем ID пользователей
-            cursor = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-            user = cursor.fetchone()
-            if user:
-                user_id = user['id']
-
-            cursor = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (partner_telegram_id,))
-            partner = cursor.fetchone()
-            if partner:
-                partner_id = partner['id']
+            user = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
+            partner = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", partner_telegram_id)
 
             # Удаляем соединения
-            conn.execute("DELETE FROM active_connections WHERE telegram_id IN (?, ?)",
-                         (telegram_id, partner_telegram_id))
+            await conn.execute("DELETE FROM active_connections WHERE telegram_id IN ($1, $2)",
+                               telegram_id, partner_telegram_id)
 
             # Обновляем сессию
             if session_id:
-                conn.execute("""
+                await conn.execute("""
                     UPDATE sessions 
                     SET ended_at = CURRENT_TIMESTAMP 
-                    WHERE id = ?
-                """, (session_id,))
+                    WHERE id = $1
+                """, session_id)
 
             # Обновляем статистику пользователей
             if user:
-                conn.execute("""
+                await conn.execute("""
                     UPDATE users 
                     SET session_count = session_count + 1, 
                         updated_at = CURRENT_TIMESTAMP 
-                    WHERE id = ?
-                """, (user_id,))
+                    WHERE id = $1
+                """, user['id'])
 
             if partner:
-                conn.execute("""
+                await conn.execute("""
                     UPDATE users 
                     SET session_count = session_count + 1, 
                         updated_at = CURRENT_TIMESTAMP 
-                    WHERE id = ?
-                """, (partner_id,))
+                    WHERE id = $1
+                """, partner['id'])
 
             return partner_telegram_id
 
-    def increment_message_count(self, telegram_id: int):
+    async def increment_message_count(self, telegram_id: int):
         """Увеличение счетчика сообщений"""
-        with self._connection() as conn:
-            conn.execute("""
+        async with self._get_connection() as conn:
+            await conn.execute("""
                 UPDATE users 
                 SET message_count = message_count + 1, 
                     updated_at = CURRENT_TIMESTAMP,
                     last_seen = CURRENT_TIMESTAMP 
-                WHERE telegram_id = ?
-            """, (telegram_id,))
+                WHERE telegram_id = $1
+            """, telegram_id)
 
-    def get_user_stats(self, telegram_id: int) -> dict:
+    async def get_user_stats(self, telegram_id: int) -> dict:
         """Получение статистики пользователя"""
-        with self._connection() as conn:
-            cursor = conn.execute("""
+        async with self._get_connection() as conn:
+            result = await conn.fetchrow("""
                 SELECT 
                     u.*,
                     (SELECT COUNT(*) FROM users) as total_users,
                     (SELECT COUNT(*) FROM search_queue) as searching_users,
                     (SELECT COUNT(*) FROM active_connections) / 2 as active_chats
                 FROM users u
-                WHERE u.telegram_id = ?
-            """, (telegram_id,))
+                WHERE u.telegram_id = $1
+            """, telegram_id)
 
-            result = cursor.fetchone()
-            if result:
-                return dict(result)
-            return {}
+            return dict(result) if result else {}
 
-    def get_user_by_telegram_id(self, telegram_id: int) -> Optional[dict]:
+    async def get_user_by_telegram_id(self, telegram_id: int) -> Optional[dict]:
         """Получение пользователя по Telegram ID"""
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM users WHERE telegram_id = ?",
-                (telegram_id,)
+        async with self._get_connection() as conn:
+            result = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id
             )
-            result = cursor.fetchone()
             return dict(result) if result else None
 
-    def cleanup_old_searches(self, hours: int = 1):
+    async def cleanup_old_searches(self, hours: int = 1):
         """Очистка старых поисков"""
-        with self._connection() as conn:
-            conn.execute("""
+        async with self._get_connection() as conn:
+            await conn.execute("""
                 DELETE FROM search_queue 
-                WHERE joined_at < datetime('now', ?)
-            """, (f'-{hours} hours',))
+                WHERE joined_at < NOW() - INTERVAL '$1 HOURS'
+            """, hours)
 
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
@@ -586,7 +587,7 @@ messages = AppleMessages()
 async def cmd_start(message: Message, state: FSMContext):
     """Приветствие — элегантное и информативное"""
     # Регистрируем пользователя
-    user_data = db.create_or_update_user(
+    user_data = await db.create_or_update_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username or "",
         first_name=message.from_user.first_name or "Пользователь"
@@ -619,13 +620,13 @@ async def cmd_search_command(message: Message, state: FSMContext):
 
 async def search_handler(message: Message, state: FSMContext):
     """Общий обработчик поиска"""
-    user = db.get_user_by_telegram_id(message.from_user.id)
+    user = await db.get_user_by_telegram_id(message.from_user.id)
     if not user:
         await cmd_start(message, state)
         return
 
     # Проверяем активный чат
-    partner_id = db.get_active_partner(message.from_user.id)
+    partner_id = await db.get_active_partner(message.from_user.id)
     if partner_id:
         await state.set_state(ChatStates.chatting)
         await message.answer(
@@ -636,7 +637,7 @@ async def search_handler(message: Message, state: FSMContext):
         return
 
     # Входим в очередь поиска
-    success = db.join_search_queue(message.from_user.id)
+    success = await db.join_search_queue(message.from_user.id)
 
     if not success:
         await message.answer(
@@ -656,15 +657,15 @@ async def search_handler(message: Message, state: FSMContext):
 
     # Пытаемся найти собеседника сразу и с небольшой задержкой
     await asyncio.sleep(1)
-    partner_id = db.find_partner(message.from_user.id)
+    partner_id = await db.find_partner(message.from_user.id)
 
     if partner_id:
         # Получаем данные партнера
-        partner_data = db.get_user_by_telegram_id(partner_id)
+        partner_data = await db.get_user_by_telegram_id(partner_id)
 
         if not partner_data:
             await message.answer("❌ Ошибка: данные партнера не найдены")
-            db.leave_search_queue(message.from_user.id)
+            await db.leave_search_queue(message.from_user.id)
             await state.set_state(ChatStates.main)
             return
 
@@ -706,7 +707,7 @@ async def cmd_cancel_command(message: Message, state: FSMContext):
 
 async def cancel_handler(message: Message, state: FSMContext):
     """Общий обработчик отмены поиска"""
-    db.leave_search_queue(message.from_user.id)
+    await db.leave_search_queue(message.from_user.id)
 
     await state.set_state(ChatStates.main)
 
@@ -733,7 +734,7 @@ async def cmd_stop_command(message: Message, state: FSMContext):
 async def cmd_next(message: Message, state: FSMContext):
     """Поиск следующего собеседника"""
     # Завершаем текущую сессию
-    partner_id = db.end_session(message.from_user.id)
+    partner_id = await db.end_session(message.from_user.id)
 
     if partner_id:
         # Уведомляем текущего партнера
@@ -753,13 +754,13 @@ async def cmd_next(message: Message, state: FSMContext):
 
 async def stop_handler(message: Message, state: FSMContext):
     """Общий обработчик завершения диалога"""
-    user = db.get_user_by_telegram_id(message.from_user.id)
+    user = await db.get_user_by_telegram_id(message.from_user.id)
 
     if not user:
         await cmd_start(message, state)
         return
 
-    partner_id = db.end_session(message.from_user.id)
+    partner_id = await db.end_session(message.from_user.id)
 
     if partner_id:
         # Уведомляем партнера
@@ -800,7 +801,7 @@ async def cmd_stats_command(message: Message):
 
 async def stats_handler(message: Message):
     """Общий обработчик статистики"""
-    user = db.get_user_by_telegram_id(message.from_user.id)
+    user = await db.get_user_by_telegram_id(message.from_user.id)
 
     if not user:
         await message.answer(
@@ -809,7 +810,7 @@ async def stats_handler(message: Message):
         )
         return
 
-    stats = db.get_user_stats(message.from_user.id)
+    stats = await db.get_user_stats(message.from_user.id)
 
     await message.answer(
         messages.stats(stats),
@@ -838,12 +839,12 @@ async def cmd_admin(message: Message):
         )
         return
 
-    user = db.get_user_by_telegram_id(message.from_user.id)
+    user = await db.get_user_by_telegram_id(message.from_user.id)
     if not user:
         await message.answer("Сначала запустите бота командой /start")
         return
 
-    stats = db.get_user_stats(message.from_user.id)
+    stats = await db.get_user_stats(message.from_user.id)
 
     admin_text = f"""
 {design.format_header("🛠 Панель администратора")}
@@ -866,7 +867,7 @@ async def cmd_admin(message: Message):
 async def handle_chat_message(message: Message, state: FSMContext):
     """Обработка сообщений в чате — плавная пересылка"""
     # Получаем партнера
-    partner_id = db.get_active_partner(message.from_user.id)
+    partner_id = await db.get_active_partner(message.from_user.id)
 
     if not partner_id:
         # Если партнера нет, переводим в главное состояние
@@ -879,7 +880,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
         return
 
     # Увеличиваем счетчик сообщений
-    db.increment_message_count(message.from_user.id)
+    await db.increment_message_count(message.from_user.id)
 
     try:
         # Пересылаем сообщение партнеру
@@ -930,7 +931,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
             parse_mode="HTML"
         )
         # Если ошибка доставки, завершаем сессию
-        db.end_session(message.from_user.id)
+        await db.end_session(message.from_user.id)
         await state.set_state(ChatStates.main)
         await message.answer(
             messages.partner_left(),
@@ -943,7 +944,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
 async def handle_searching_message(message: Message, state: FSMContext):
     """Сообщение во время поиска"""
     # Проверяем, не нашли ли мы уже партнера
-    partner_id = db.get_active_partner(message.from_user.id)
+    partner_id = await db.get_active_partner(message.from_user.id)
     if partner_id:
         # Если партнер найден, переводим в состояние чата
         await state.set_state(ChatStates.chatting)
@@ -995,7 +996,7 @@ async def background_tasks():
     while True:
         try:
             # Очистка старых поисков каждые 30 минут
-            db.cleanup_old_searches()
+            await db.cleanup_old_searches()
             await asyncio.sleep(1800)  # 30 минут
         except Exception as e:
             logging.error(f"Ошибка в фоновой задаче: {e}")
@@ -1016,6 +1017,12 @@ async def main():
 
     if not TOKEN:
         logging.error("❌ BOT_TOKEN не найден")
+        return
+
+    # Инициализация базы данных
+    db_success = await db.init()
+    if not db_success:
+        logging.error("❌ Не удалось инициализировать базу данных")
         return
 
     # Инициализация бота
