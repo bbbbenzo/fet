@@ -248,6 +248,20 @@ class Database:
                         target_gender = NULL
                 """, telegram_id)
 
+    async def is_in_active_group(self, telegram_id: int) -> bool:
+        """Проверяет, состоит ли пользователь в активной группе (с хотя бы 2 участниками)"""
+        async with self.get_connection() as conn:
+            result = await conn.fetchrow("""
+                SELECT gc.id
+                FROM group_chats gc
+                JOIN group_chat_members gcm ON gc.id = gcm.group_id
+                WHERE gcm.telegram_id = $1
+                  AND gc.is_active = TRUE
+                  AND (SELECT COUNT(*) FROM group_chat_members gcm2 WHERE gcm2.group_id = gc.id) >= 2
+                LIMIT 1
+            """, telegram_id)
+            return result is not None
+
     async def remove_from_search(self, telegram_id: int):
         """Удалить из очереди поиска"""
         async with self.get_connection() as conn:
@@ -2255,146 +2269,110 @@ async def find_last_partner(telegram_id: int):
     return None, None
 
 
-# ========== ПЕРЕСЫЛКА СООБЩЕНИЙ В ГРУППОВОМ ЧАТЕ ==========
 @router.message(ChatState.chatting)
-async def group_chat_forward(message: Message, state: FSMContext):
-    """Пересылает все сообщения в групповом чате всем участникам группы (кроме отправителя)"""
-    # Проверяем, является ли пользователь участником группового чата
+async def chat_forward(message: Message, state: FSMContext):
+    """Универсальная пересылка: групповой или 1-на-1 чат — все типы сообщений"""
+
+    # === Проверяем, в групповом ли чате ===
     group_members = await db.get_group_members(message.from_user.id)
 
-    if not group_members or len(group_members) <= 1:
-        # Не в групповом чате или один — ничего не делаем (сообщения обрабатываются другими хендлерами)
-        return
+    if group_members and len(group_members) > 1:
+        # === ГРУППОВОЙ ЧАТ ===
+        sender_id = message.from_user.id
+        recipients = [m for m in group_members if m != sender_id]
 
-    sender_id = message.from_user.id
-    recipients = [m for m in group_members if m != sender_id]  # все кроме отправителя
+        if not recipients:
+            return
 
-    if not recipients:
-        return
+        try:
+            # Пересылаем любой тип контента
+            if message.text:
+                for r in recipients:
+                    await message.bot.copy_message(chat_id=r, from_chat_id=message.chat.id,
+                                                   message_id=message.message_id)
+            elif message.photo:
+                photo = message.photo[-1]
+                for r in recipients:
+                    await message.bot.send_photo(r, photo.file_id, caption=message.caption)
+            elif message.video:
+                for r in recipients:
+                    await message.bot.send_video(r, message.video.file_id, caption=message.caption)
+            elif message.video_note:  # кружочек
+                for r in recipients:
+                    await message.bot.send_video_note(r, message.video_note.file_id)
+            elif message.sticker:
+                for r in recipients:
+                    await message.bot.send_sticker(r, message.sticker.file_id)
+            elif message.animation:  # GIF
+                for r in recipients:
+                    await message.bot.send_animation(r, message.animation.file_id, caption=message.caption)
+            elif message.voice:
+                for r in recipients:
+                    await message.bot.send_voice(r, message.voice.file_id, caption=message.caption)
+            elif message.document:
+                for r in recipients:
+                    await message.bot.send_document(r, message.document.file_id, caption=message.caption)
+            elif message.audio:
+                for r in recipients:
+                    await message.bot.send_audio(r, message.audio.file_id, caption=message.caption)
+            else:
+                # Для остальных типов (например, contact, location) — можно добавить по желанию
+                pass
+        except Exception as e:
+            logger.error(f"Ошибка пересылки в группе от {sender_id}: {e}")
+        return  # Важно — выходим, чтобы не обрабатывать как 1-на-1
 
-    # Определяем тип сообщения и пересылаем соответствующим способом
-    try:
-        if message.text:
-            # Текстовое сообщение
-            for recipient in recipients:
-                await message.bot.send_message(recipient, message.text)
-
-        elif message.photo:
-            # Фото (берём лучшее качество)
-            photo = message.photo[-1]
-            for recipient in recipients:
-                await message.bot.send_photo(recipient, photo.file_id, caption=message.caption)
-
-        elif message.video:
-            for recipient in recipients:
-                await message.bot.send_video(
-                    recipient,
-                    message.video.file_id,
-                    caption=message.caption,
-                    duration=message.video.duration,
-                    width=message.video.width,
-                    height=message.video.height
-                )
-
-        elif message.video_note:
-            for recipient in recipients:
-                await message.bot.send_video_note(recipient, message.video_note.file_id)
-
-        elif message.voice:
-            for recipient in recipients:
-                await message.bot.send_voice(recipient, message.voice.file_id, caption=message.caption)
-
-        elif message.audio:
-            for recipient in recipients:
-                await message.bot.send_audio(
-                    recipient,
-                    message.audio.file_id,
-                    caption=message.caption,
-                    duration=message.audio.duration,
-                    performer=message.audio.performer,
-                    title=message.audio.title
-                )
-
-        elif message.document:
-            for recipient in recipients:
-                await message.bot.send_document(recipient, message.document.file_id, caption=message.caption)
-
-        elif message.sticker:
-            for recipient in recipients:
-                await message.bot.send_sticker(recipient, message.sticker.file_id)
-
-        elif message.animation:
-            for recipient in recipients:
-                await message.bot.send_animation(recipient, message.animation.file_id, caption=message.caption)
-
-        elif message.location:
-            for recipient in recipients:
-                await message.bot.send_location(recipient, message.location.latitude, message.location.longitude)
-
-        elif message.contact:
-            for recipient in recipients:
-                await message.bot.send_contact(
-                    recipient,
-                    phone_number=message.contact.phone_number,
-                    first_name=message.contact.first_name,
-                    last_name=message.contact.last_name
-                )
-
-        # Добавь другие типы по необходимости (poll, dice и т.д.)
-
-    except Exception as e:
-        logger.error(f"Ошибка пересылки сообщения в групповом чате от {sender_id}: {e}")
-        # Если ошибка (например, пользователь заблокировал бота) — можно завершить чат для всех, но пока просто логируем
-
-
-# ========== ПЕРЕСЫЛКА СООБЩЕНИЙ ==========
-@router.message(F.text, ChatState.chatting)
-async def forward_message(message: Message, state: FSMContext):
-    """Пересылать текстовые сообщения между собеседниками"""
-    # Проверяем, действительно ли пользователь в состоянии chatting
-    current_state = await state.get_state()
-
-    # Если состояние не chatting, но есть активный партнер в базе,
-    # восстанавливаем состояние
+    # === 1-НА-1 ЧАТ ===
     partner_id = await db.get_partner(message.from_user.id)
-
     if not partner_id:
-        # Нет активного партнера, возвращаем в главное меню
         await state.set_state(ChatState.idle)
-        await message.answer(
-            "Диалог завершен 😐\n\nОтправьте /search, чтобы начать новый поиск",
-            reply_markup=get_main_keyboard()
-        )
+        await message.answer("Диалог завершён. Начните новый поиск.", reply_markup=get_main_keyboard())
         return
 
-    # Если состояние не chatting, но партнер есть, восстанавливаем состояние
-    if current_state != ChatState.chatting:
-        await state.set_state(ChatState.chatting)
-
-    # Отправляем сообщение партнеру
     try:
-        await message.bot.send_message(partner_id, message.text)
+        # Полная пересылка всех типов сообщений в 1-на-1
+        if message.text:
+            await message.bot.send_message(partner_id, message.text)
+        elif message.photo:
+            photo = message.photo[-1]
+            await message.bot.send_photo(partner_id, photo.file_id, caption=message.caption)
+        elif message.video:
+            await message.bot.send_video(partner_id, message.video.file_id, caption=message.caption)
+        elif message.video_note:  # кружочек
+            await message.bot.send_video_note(partner_id, message.video_note.file_id)
+        elif message.sticker:
+            await message.bot.send_sticker(partner_id, message.sticker.file_id)
+        elif message.animation:  # GIF / анимированный стикер
+            await message.bot.send_animation(partner_id, message.animation.file_id, caption=message.caption)
+        elif message.voice:
+            await message.bot.send_voice(partner_id, message.voice.file_id, caption=message.caption)
+        elif message.document:
+            await message.bot.send_document(partner_id, message.document.file_id, caption=message.caption)
+        elif message.audio:
+            await message.bot.send_audio(partner_id, message.audio.file_id, caption=message.caption)
+        elif message.location:
+            await message.bot.send_location(partner_id, message.location.latitude, message.location.longitude)
+        elif message.contact:
+            await message.bot.send_contact(partner_id, phone_number=message.contact.phone_number,
+                                           first_name=message.contact.first_name, last_name=message.contact.last_name)
+        else:
+            # Если тип не поддерживается — уведомляем
+            await message.answer("❌ Этот тип сообщения пока не поддерживается в чате.")
+            return
 
-        # Обновляем счетчик сообщений в сессии
+        # Обновляем счётчик сообщений (только для 1-на-1)
         session_id = await db.get_session(message.from_user.id)
         if session_id:
             async with db.get_connection() as conn:
-                await conn.execute("""
-                    UPDATE chat_sessions 
-                    SET message_count = message_count + 1 
-                    WHERE id = $1
-                """, session_id)
+                await conn.execute("UPDATE chat_sessions SET message_count = message_count + 1 WHERE id = $1",
+                                   session_id)
 
     except Exception as e:
-        logger.error(f"Ошибка пересылки сообщения: {e}")
-
-        # Если не удалось отправить, возможно, партнер отключился
+        logger.error(f"Ошибка пересылки в 1-на-1 от {message.from_user.id} к {partner_id}: {e}")
         await db.end_chat(message.from_user.id)
         await state.set_state(ChatState.idle)
-
         await message.answer(
-            "❌ Не удалось отправить сообщение. Собеседник отключился.\n\n"
-            "Отправьте /search, чтобы начать новый поиск",
+            "❌ Собеседник отключился или заблокировал бота.\n\nНачните новый поиск.",
             reply_markup=get_main_keyboard()
         )
 
@@ -2571,41 +2549,35 @@ async def forward_all_media(message: Message, state: FSMContext):
 # ========== ПРОВЕРКА АКТИВНОГО ЧАТА ПРИ ЛЮБОМ СООБЩЕНИИ ==========
 @router.message()
 async def check_active_chat(message: Message, state: FSMContext):
-    """Проверяем активный чат при любом сообщении"""
-    # Пропускаем команды
+    """Бесшовное восстановление состояния чата (1-на-1 или групповой) после перезапуска бота"""
+    # Пропускаем команды — они должны обрабатываться нормально
     if message.text and message.text.startswith('/'):
         return
 
-    # Проверяем состояние
     current_state = await state.get_state()
 
-    # Если состояние chatting, но партнера нет - исправляем
-    if current_state == ChatState.chatting:
-        partner_id = await db.get_partner(message.from_user.id)
-        if not partner_id:
-            await state.set_state(ChatState.idle)
-            await message.answer(
-                "Диалог завершен 😐\n\nОтправьте /search, чтобы начать новый поиск",
-                reply_markup=get_main_keyboard()
-            )
-    # Если состояние не установлено или idle, но есть активный партнер
-    elif current_state in [None, ChatState.idle.state]:
-        partner_id = await db.get_partner(message.from_user.id)
-        if partner_id:
-            # Тихо восстанавливаем состояние
-            await state.set_state(ChatState.chatting)
-            # И ПЕРЕСЫЛАЕМ ПЕРВОЕ СООБЩЕНИЕ!
-            try:
-                await message.bot.send_message(partner_id, message.text)
-            except Exception as e:
-                logger.error(f"Ошибка пересылки сообщения при восстановлении: {e}")
-                await db.end_chat(message.from_user.id)
-                await state.set_state(ChatState.idle)
-                await message.answer(
-                    "❌ Не удалось отправить сообщение. Собеседник отключился.\n\n"
-                    "Отправьте /search, чтобы начать новый поиск",
-                    reply_markup=get_main_keyboard()
-                )
+    # Если уже в чате — ничего не делаем, сообщение пойдёт в chat_forward
+    if current_state == ChatState.chatting.state:
+        return
+
+    restored = False
+
+    # === Восстановление 1-на-1 чата ===
+    partner_id = await db.get_partner(message.from_user.id)
+    if partner_id:
+        await state.set_state(ChatState.chatting)
+        restored = True
+
+    # === Восстановление группового чата ===
+    elif await db.is_in_active_group(message.from_user.id):
+        await state.set_state(ChatState.chatting)
+        restored = True
+
+    # Если мы восстановили состояние — вручную пересылаем текущее (первое) сообщение
+    if restored:
+        # Созываем тот же обработчик, который отвечает за пересылку
+        await chat_forward(message, state)
+        return  # важно — прерываем дальнейшую обработку
 
 
 @router.pre_checkout_query()
