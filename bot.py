@@ -1365,37 +1365,54 @@ async def group_search_menu(message: Message, state: FSMContext):
 
 @router.message(GroupSearchState.selecting_mode)
 async def start_group_search(message: Message, state: FSMContext):
-    """Запуск группового поиска — с проверкой на допустимость выбора по полу"""
     if message.text == "← Назад":
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard())
         return
 
-    user_gender = (await db.get_user_profile(message.from_user.id))['gender']
+    user_profile = await db.get_user_profile(message.from_user.id)
+    user_gender = user_profile['gender']
 
+    # Случайный поиск — доступен всем
     if message.text == "🎲 Случайные собеседники":
         target_gender = None
         search_text = "собеседников"
-    elif message.text == "🙋‍♀️ Найти девушек":
-        if user_gender != "male":
-            await message.answer("❌ Эта опция доступна только парням.")
+
+    # Гендерные варианты
+    elif message.text in ["🙋‍♀️ Найти девушек", "🙋‍♂️ Найти парней"]:
+        # === СНАЧАЛА ПРОВЕРЯЕМ ПРЕМИУМ ===
+        if not await db.has_active_premium(message.from_user.id):
+            await message.answer(
+                "🍓 <b>Поиск по полу в групповом чате</b> — эксклюзивная премиум-функция!\n\n"
+                "Чтобы создать группу именно с девушками или парнями — активируйте премиум:\n\n"
+                "💎 <b>Выберите подписку:</b>",
+                parse_mode="HTML",
+                reply_markup=get_premium_inline_keyboard()
+            )
             return
-        target_gender = "female"
-        search_text = "девушек"
-    elif message.text == "🙋‍♂️ Найти парней":
-        if user_gender != "female":
-            await message.answer("❌ Эта опция доступна только девушкам.")
-            return
-        target_gender = "male"
-        search_text = "парней"
+
+        # === ТОЛЬКО ЕСЛИ ПРЕМИУМ ЕСТЬ — ПРОВЕРЯЕМ ПОЛ ===
+        if message.text == "🙋‍♀️ Найти девушек":
+            if user_gender != "male":
+                await message.answer("❌ Эта опция доступна только парням.")
+                return
+            target_gender = "female"
+            search_text = "девушек"
+
+        elif message.text == "🙋‍♂️ Найти парней":
+            if user_gender != "female":
+                await message.answer("❌ Эта опция доступна только девушкам.")
+                return
+            target_gender = "male"
+            search_text = "парней"
+
     else:
         await message.answer("Выберите вариант из меню.")
         return
 
-    # Добавляем в очередь группового поиска
+    # Если дошли сюда — всё ок: либо случайный, либо премиум + правильный пол
     await db.add_to_group_search(message.from_user.id, target_gender)
 
-    # Пытаемся найти или создать группу
     result = await db.find_group_partner(message.from_user.id, target_gender, message.bot)
 
     if result:
@@ -1406,12 +1423,9 @@ async def start_group_search(message: Message, state: FSMContext):
         for member in members:
             try:
                 if is_joining and member == initiator_id:
-                    pass  # Уведомление уже отправлено в БД
-                elif is_joining:
-                    pass
-                else:
-                    text = f"👥 Групповой чат создан!\n\nУчастников: {member_count}\n\n/leave - Покинуть групповой чат"
-                    await message.bot.send_message(member, text, parse_mode="HTML")
+                    continue
+                text = f"👥 Групповой чат создан!\n\nУчастников: {member_count}\n\n/leave - Покинуть групповой чат"
+                await message.bot.send_message(member, text, parse_mode="HTML")
 
                 key = StorageKey(bot_id=message.bot.id, chat_id=member, user_id=member)
                 member_state = FSMContext(storage=state.storage, key=key)
@@ -1675,28 +1689,69 @@ async def cmd_search(message: Message, state: FSMContext):
     if partner_data:
         partner_id, _ = partner_data
 
-        # Первый пользователь (инициатор)
+        # Получаем профиль партнёра один раз
+        partner_profile = await db.get_user_profile(partner_id)
+
+        # === Сообщение инициатору поиска ===
+        initiator_has_premium = await db.has_active_premium(message.from_user.id)
+
+        if initiator_has_premium and partner_profile:
+            gender_text = "Парень" if partner_profile['gender'] == "male" else "Девушка"
+            age_text = partner_profile['age'] if partner_profile['age'] else "Не указан"
+
+            initiator_text = (
+                f"<b>Собеседник найден!</b>\n\n"
+                f"<i>Пол: {gender_text}</i>\n"
+                f"<i>Возраст: {age_text}</i>\n\n"
+                f"<i>/next — искать следующего</i>\n"
+                f"<i>/stop — закончить диалог</i>"
+            )
+        else:
+            initiator_text = (
+                "<b>Собеседник найден!</b>\n\n"
+                "<i>/next — искать следующего</i>\n"
+                "<i>/stop — закончить диалог</i>"
+            )
+
         await message.answer(
-            "<b>Собеседник найден!</b>\n\n"
-            "<i>/next — искать следующего</i>\n"
-            "<i>/stop — закончить диалог</i>",
+            initiator_text,
             parse_mode="HTML",
             reply_markup=None
         )
         await state.set_state(ChatState.chatting)
 
-        # Второй пользователь
+        # === Сообщение партнёру ===
         try:
+            partner_has_premium = await db.has_active_premium(partner_id)
+
+            if partner_has_premium and partner_profile:
+                # Для партнёра показываем профиль ИНИЦИАТОРА
+                initiator_profile = await db.get_user_profile(message.from_user.id)
+                gender_text = "Парень" if initiator_profile['gender'] == "male" else "Девушка"
+                age_text = initiator_profile['age'] if initiator_profile['age'] else "Не указан"
+
+                partner_text = (
+                    f"<b>Собеседник найден!</b>\n\n"
+                    f"<i>Пол: {gender_text}</i>\n"
+                    f"<i>Возраст: {age_text}</i>\n\n"
+                    f"<i>/next — искать следующего</i>\n"
+                    f"<i>/stop — закончить диалог</i>"
+                )
+            else:
+                partner_text = (
+                    "<b>Собеседник найден!</b>\n\n"
+                    "<i>/next — искать следующего</i>\n"
+                    "<i>/stop — закончить диалог</i>"
+                )
+
             await message.bot.send_message(
                 partner_id,
-                "<b>Собеседник найден!</b>\n\n"
-                "<i>/next — искать следующего</i>\n"
-                "<i>/stop — закончить диалог</i>",
+                partner_text,
                 parse_mode="HTML",
                 reply_markup=None
             )
 
-            # Устанавливаем состояние chatting второму пользователю
+            # Устанавливаем состояние партнёру
             partner_key = StorageKey(
                 bot_id=message.bot.id,
                 chat_id=partner_id,
