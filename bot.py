@@ -635,30 +635,37 @@ class Database:
 
                 if target_gender:
                     # === ГЕНДЕРНЫЙ ПОИСК ===
-                    # Берём до 2 человек строго нужного пола (включая случайных)
-                    query = base_query + " AND u.gender = $2 ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
-                    params = [telegram_id, target_gender]  # Явно задаём оба параметра
-                    logger.info(f"Гендерный поиск: query={query}, params={params}")
-                    partners = await conn.fetch(query, *params)
-                    logger.info(f"Гендерный поиск ({target_gender}): найдено {len(partners)} подходящих")
+                    # Приоритет: случайные нужного пола (чтобы не смешиваться с другими гендерными искателями)
+                    # Этап 1: ищем случайных нужного пола
+                    random_gender_query = base_query + " AND u.gender = $2 AND gsq.target_gender IS NULL ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
+                    random_params = [telegram_id, target_gender]
+                    random_partners = await conn.fetch(random_gender_query, *random_params)
+
+                    if random_partners:
+                        logger.info(f"Гендерный поиск: найдены случайные нужного пола ({len(random_partners)})")
+                        partners = random_partners
+                    else:
+                        # Этап 2: случайных нет — берём ОДНОГО, кто ищет мой пол (взаимность)
+                        mutual_gender_query = base_query + " AND u.gender = $2 AND gsq.target_gender = $3 ORDER BY gsq.joined_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+                        mutual_params = [telegram_id, target_gender, my_gender]
+                        partners = await conn.fetch(mutual_gender_query, *mutual_params)
+                        logger.info(f"Гендерный поиск: случайных нет, найден 1 взаимный (ищущий {my_gender})")
+
+                    if not partners:
+                        logger.info("Гендерный поиск: никого не найдено — ждём")
                 else:
-                    # === СЛУЧАЙНЫЙ ПОИСК ===
-                    # Этап 1: ищем ровно одного, кто ищет мой пол (взаимность)
+                    # === СЛУЧАЙНЫЙ ПОИСК (остаётся как было) ===
                     mutual_query = base_query + " AND gsq.target_gender = $2 ORDER BY gsq.joined_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
                     mutual_params = [telegram_id, my_gender]
-                    logger.info(f"Случайный поиск (взаимные): query={mutual_query}, params={mutual_params}")
                     mutual_partners = await conn.fetch(mutual_query, *mutual_params)
 
                     if mutual_partners:
-                        logger.info(f"Случайный поиск: найден 1 взаимный партнёр (ищущий {my_gender})")
+                        logger.info(f"Случайный поиск: найден 1 взаимный партнёр")
                         partners = mutual_partners
                     else:
-                        # Этап 2: нет взаимных — берём до 2 случайных
                         random_query = base_query + " AND gsq.target_gender IS NULL ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
-                        random_params = [telegram_id]
-                        logger.info(f"Случайный поиск (случайные): query={random_query}, params={random_params}")
-                        partners = await conn.fetch(random_query, *random_params)
-                        logger.info(f"Случайный поиск: взаимных нет, берём случайных ({len(partners)})")
+                        partners = await conn.fetch(random_query, *base_params)
+                        logger.info(f"Случайный поиск: берём случайных ({len(partners)})")
 
                 logger.info(
                     f"Найдено подходящих партнёров: {[(p['telegram_id'], p['gender'], p['target_gender']) for p in partners]}"
