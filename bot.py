@@ -623,7 +623,6 @@ class Database:
                     return None
                 logger.info(f"Мой пол: {my_gender}")
 
-                # Базовый запрос
                 base_query = """
                     SELECT gsq.telegram_id, u.gender, gsq.target_gender
                     FROM group_search_queue gsq
@@ -632,32 +631,35 @@ class Database:
                 """
                 base_params = [telegram_id]
 
-                partners = []  # Инициализируем сразу, чтобы избежать UnboundLocalError
+                partners = []
 
                 if target_gender:
                     # === ГЕНДЕРНЫЙ ПОИСК ===
                     # Берём до 2 человек строго нужного пола (включая случайных)
                     query = base_query + " AND u.gender = $2 ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
-                    params = base_params + [target_gender]
+                    params = [telegram_id, target_gender]  # Явно задаём оба параметра
+                    logger.info(f"Гендерный поиск: query={query}, params={params}")
                     partners = await conn.fetch(query, *params)
                     logger.info(f"Гендерный поиск ({target_gender}): найдено {len(partners)} подходящих")
                 else:
                     # === СЛУЧАЙНЫЙ ПОИСК ===
-                    # Этап 1: ищем тех, кто специально ищет мой пол (взаимность — приоритет для гендерного поиска)
-                    mutual_query = base_query + " AND gsq.target_gender = $2 ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
-                    mutual_params = base_params + [my_gender]
+                    # Этап 1: ищем ровно одного, кто ищет мой пол (взаимность)
+                    mutual_query = base_query + " AND gsq.target_gender = $2 ORDER BY gsq.joined_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+                    mutual_params = [telegram_id, my_gender]
+                    logger.info(f"Случайный поиск (взаимные): query={mutual_query}, params={mutual_params}")
                     mutual_partners = await conn.fetch(mutual_query, *mutual_params)
 
                     if mutual_partners:
-                        logger.info(f"Случайный поиск: найдены взаимные партнёры ({len(mutual_partners)} чел., ищущих {my_gender})")
+                        logger.info(f"Случайный поиск: найден 1 взаимный партнёр (ищущий {my_gender})")
                         partners = mutual_partners
                     else:
-                        # Этап 2: нет взаимных — берём других случайных
+                        # Этап 2: нет взаимных — берём до 2 случайных
                         random_query = base_query + " AND gsq.target_gender IS NULL ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
-                        partners = await conn.fetch(random_query, *base_params)
-                        logger.info(f"Случайный поиск: взаимных нет, берём случайных ({len(partners)} чел.)")
+                        random_params = [telegram_id]
+                        logger.info(f"Случайный поиск (случайные): query={random_query}, params={random_params}")
+                        partners = await conn.fetch(random_query, *random_params)
+                        logger.info(f"Случайный поиск: взаимных нет, берём случайных ({len(partners)})")
 
-                # === Общий лог и проверка ===
                 logger.info(
                     f"Найдено подходящих партнёров: {[(p['telegram_id'], p['gender'], p['target_gender']) for p in partners]}"
                 )
@@ -668,11 +670,11 @@ class Database:
 
                 # Создаём группу
                 partner_ids = [row['telegram_id'] for row in partners]
+                all_members = [telegram_id] + partner_ids
 
                 new_group = await conn.fetchrow("INSERT INTO group_chats DEFAULT VALUES RETURNING id")
                 group_id = new_group['id']
 
-                all_members = [telegram_id] + partner_ids
                 for member in all_members:
                     await conn.execute(
                         "INSERT INTO group_chat_members (group_id, telegram_id) VALUES ($1, $2)",
