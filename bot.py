@@ -1815,8 +1815,8 @@ async def cmd_stop(message: Message, state: FSMContext):
 
                 await message.bot.send_message(
                     partner_id,
-                    "Диалог завершен 😐\n\n"
-                    "Отправьте /search, чтобы начать поиск",
+                    "<i>Диалог остановлен</i> 😔\n\n"
+                    "<i>Отправьте /search, чтобы начать поиск</i>",
                     parse_mode="HTML",
                     reply_markup=get_rating_inline_keyboard()  # ИЗМЕНЕНИЕ: inline-кнопки
                 )
