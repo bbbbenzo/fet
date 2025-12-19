@@ -623,37 +623,50 @@ class Database:
                     return None
                 logger.info(f"Мой пол: {my_gender}")
 
-                query = """
+                # Базовый запрос
+                base_query = """
                     SELECT gsq.telegram_id, u.gender, gsq.target_gender
                     FROM group_search_queue gsq
                     JOIN users u ON u.telegram_id = gsq.telegram_id
                     WHERE gsq.telegram_id != $1
                 """
-                params = [telegram_id]
+                base_params = [telegram_id]
+
+                partners = []  # Инициализируем сразу, чтобы избежать UnboundLocalError
 
                 if target_gender:
-                    # Ищем только нужный пол
-                    query += " AND u.gender = $2"
-                    params.append(target_gender)
-                    # Принимаем: случайный поиск ИЛИ тот, кто ищет мой пол (взаимность)
-                    query += " AND (gsq.target_gender IS NULL OR gsq.target_gender = $3)"
-                    params.append(my_gender)
+                    # === ГЕНДЕРНЫЙ ПОИСК ===
+                    # Берём до 2 человек строго нужного пола (включая случайных)
+                    query = base_query + " AND u.gender = $2 ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
+                    params = base_params + [target_gender]
+                    partners = await conn.fetch(query, *params)
+                    logger.info(f"Гендерный поиск ({target_gender}): найдено {len(partners)} подходящих")
                 else:
-                    # Случайный поиск — принимаем только других случайных
-                    query += " AND gsq.target_gender IS NULL"
+                    # === СЛУЧАЙНЫЙ ПОИСК ===
+                    # Этап 1: ищем тех, кто специально ищет мой пол (взаимность — приоритет для гендерного поиска)
+                    mutual_query = base_query + " AND gsq.target_gender = $2 ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
+                    mutual_params = base_params + [my_gender]
+                    mutual_partners = await conn.fetch(mutual_query, *mutual_params)
 
-                query += " ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
+                    if mutual_partners:
+                        logger.info(f"Случайный поиск: найдены взаимные партнёры ({len(mutual_partners)} чел., ищущих {my_gender})")
+                        partners = mutual_partners
+                    else:
+                        # Этап 2: нет взаимных — берём других случайных
+                        random_query = base_query + " AND gsq.target_gender IS NULL ORDER BY gsq.joined_at ASC LIMIT 2 FOR UPDATE SKIP LOCKED"
+                        partners = await conn.fetch(random_query, *base_params)
+                        logger.info(f"Случайный поиск: взаимных нет, берём случайных ({len(partners)} чел.)")
 
-                partners = await conn.fetch(query, *params)
-
+                # === Общий лог и проверка ===
                 logger.info(
-                    f"Найдено подходящих партнёров: {[(p['telegram_id'], p['gender'], p['target_gender']) for p in partners]}")
+                    f"Найдено подходящих партнёров: {[(p['telegram_id'], p['gender'], p['target_gender']) for p in partners]}"
+                )
 
                 if len(partners) == 0:
                     logger.info("Нет подходящих партнёров — ждём первого")
                     return None
 
-                # Создаём группу даже с одним партнёром!
+                # Создаём группу
                 partner_ids = [row['telegram_id'] for row in partners]
 
                 new_group = await conn.fetchrow("INSERT INTO group_chats DEFAULT VALUES RETURNING id")
@@ -661,8 +674,10 @@ class Database:
 
                 all_members = [telegram_id] + partner_ids
                 for member in all_members:
-                    await conn.execute("INSERT INTO group_chat_members (group_id, telegram_id) VALUES ($1, $2)",
-                                       group_id, member)
+                    await conn.execute(
+                        "INSERT INTO group_chat_members (group_id, telegram_id) VALUES ($1, $2)",
+                        group_id, member
+                    )
 
                 await conn.execute("DELETE FROM group_search_queue WHERE telegram_id = ANY($1)", all_members)
 
