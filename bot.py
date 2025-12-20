@@ -1648,7 +1648,7 @@ async def profile_menu(message: Message, state: FSMContext):
         f"🆔 <code>{telegram_id}</code>\n\n"
         f"📊 <b>Основная информация:</b>\n"
         f"├ 🚻 Пол: <b>{gender_text}</b>\n"
-        f"└ 🔞 Возраст: <b>{age_text}</b>\n"
+        f"└ 🔞 Возраст: <b>{age_text}</b>\n\n"
         f"{premium_block}\n\n"
         f"{reputation_block}"
         f"{referral_block}"
@@ -2279,6 +2279,7 @@ async def start_gender_search(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=get_main_keyboard()
         )
+        await state.set_state(ChatState.searching)
 
 
 @router.message(Command("givepremium"))
