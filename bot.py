@@ -171,6 +171,18 @@ class Database:
                             )
                         """)
 
+            # Реферальная система
+            await conn.execute("""
+                            CREATE TABLE IF NOT EXISTS referrals (
+                                id SERIAL PRIMARY KEY,
+                                referrer_telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                                referred_telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                premium_hours_granted BOOLEAN DEFAULT FALSE,
+                                UNIQUE(referrer_telegram_id, referred_telegram_id)
+                            )
+                        """)
+
             logger.info("✅ Таблицы созданы/проверены")
 
     @asynccontextmanager
@@ -1102,6 +1114,83 @@ class Database:
 
             return " ".join(parts) if parts else "менее минуты"
 
+    async def get_referral_stats(self, telegram_id: int) -> dict:
+        """Статистика рефералов пользователя"""
+        async with self.get_connection() as conn:
+            stats = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) AS invited_total,
+                    COUNT(CASE WHEN premium_hours_granted = TRUE THEN 1 END) AS registered_count,
+                    COALESCE(SUM(CASE WHEN premium_hours_granted = TRUE THEN 1 ELSE 0 END), 0) AS hours_granted
+                FROM referrals
+                WHERE referrer_telegram_id = $1
+            """, telegram_id)
+
+            return {
+                "invited": stats['invited_total'] or 0,
+                "registered": stats['registered_count'] or 0,
+                "hours_granted": stats['hours_granted'] or 0
+            }
+
+    async def add_referral(self, referrer_id: int, referred_id: int) -> bool:
+        """Добавить реферала и начислить +1 час премиум рефереру"""
+        async with self.get_connection() as conn:
+            # Проверяем, не был ли уже засчитан
+            exists = await conn.fetchrow("""
+                SELECT 1 FROM referrals 
+                WHERE referrer_telegram_id = $1 AND referred_telegram_id = $2
+            """, referrer_id, referred_id)
+            if exists:
+                return False
+
+            # Добавляем запись
+            await conn.execute("""
+                INSERT INTO referrals (referrer_telegram_id, referred_telegram_id)
+                VALUES ($1, $2)
+            """, referrer_id, referred_id)
+
+            # Начисляем 1 час премиум (стэкается)
+            now_utc = datetime.now(timezone.utc)
+            new_expires = now_utc + timedelta(hours=1)
+
+            current = await conn.fetchrow("""
+                SELECT expires_at FROM premium
+                WHERE telegram_id = $1 AND is_active = TRUE
+            """, referrer_id)
+
+            if current:
+                current_expires = current['expires_at']
+                if current_expires.tzinfo is None:
+                    current_expires = current_expires.replace(tzinfo=timezone.utc)
+                else:
+                    current_expires = current_expires.astimezone(timezone.utc)
+
+                if current_expires > now_utc:
+                    final_expires = current_expires + timedelta(hours=1)
+                else:
+                    final_expires = new_expires
+            else:
+                final_expires = new_expires
+
+            final_expires_naive = final_expires.replace(tzinfo=None)
+
+            await conn.execute("""
+                INSERT INTO premium (telegram_id, stars_paid, duration_days, expires_at)
+                VALUES ($1, 0, 0, $2)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    expires_at = EXCLUDED.expires_at,
+                    is_active = TRUE
+            """, referrer_id, final_expires_naive)
+
+            # Отмечаем, что бонус начислен
+            await conn.execute("""
+                UPDATE referrals 
+                SET premium_hours_granted = TRUE 
+                WHERE referrer_telegram_id = $1 AND referred_telegram_id = $2
+            """, referrer_id, referred_id)
+
+            return True
+
 
 # ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ И РОУТЕРА ==========
 db = Database()
@@ -1120,6 +1209,7 @@ class ProfileState(StatesGroup):
     main = State()
     gender = State()
     age = State()
+    viewing = State()  # Новое состояние — когда смотрим профиль
 
 
 # Добавить в StatesGroup (можно добавить к существующим ChatState или создать новый)
@@ -1262,17 +1352,38 @@ def get_premium_inline_keyboard():
 # ========== КОМАНДА СТАРТ ==========
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """Обработка команды /start"""
+    """Обработка /start с реферальным параметром"""
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.first_name or ""
     )
 
+    # Обработка реферального параметра
+    args = message.text.strip().split()
+    if len(args) > 1:
+        try:
+            referrer_id = int(args[1])
+            if referrer_id != message.from_user.id and referrer_id > 1000:  # защита от фейковых ID
+                granted = await db.add_referral(referrer_id, message.from_user.id)
+                if granted:
+                    try:
+                        await message.bot.send_message(
+                            referrer_id,
+                            "🎉 <b>Ура! Новый реферал!</b>\n\n"
+                            "👤 Друг зарегистрировался по вашей ссылке\n\n"
+                            "💎 <b>Вам начислен +1 час PREMIUM</b>\n\n"
+                            "Продолжайте приглашать — чем больше друзей, тем дольше премиум! 🚀",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass  # реферер заблокировал бота
+        except ValueError:
+            pass
+
     await state.set_state(ChatState.idle)
 
-    # Получаем имя пользователя
-    user_name = message.from_user.first_name or message.from_user.username or "аноним"
+    user_name = message.from_user.first_name or "аноним"
 
     welcome_text = (
         f"👋 <b>Добро пожаловать, {user_name}!</b>\n\n"
@@ -1490,8 +1601,8 @@ async def process_buy_premium_callback(callback: CallbackQuery, bot: Bot):
 
 # ========== ПРОФИЛЬ ==========
 @router.message(F.text == "⚙️ Профиль")
-async def profile_menu(message: Message, state: FSMContext):  # ← добавил state
-    """Отображение профиля пользователя"""
+async def profile_menu(message: Message, state: FSMContext):
+    """Профиль — редактируемое сообщение, клавиатура отправляется один раз"""
     user_profile = await db.get_user_profile(message.from_user.id)
     if not user_profile:
         await message.answer("Ошибка загрузки профиля.")
@@ -1504,17 +1615,12 @@ async def profile_menu(message: Message, state: FSMContext):  # ← добави
     gender_text = "Парень" if gender == "male" else "Девушка" if gender == "female" else "Не указан"
     age_text = age if age else "Не указан"
 
-    # Статистика репутации
     stats = await db.get_user_rating_stats(telegram_id)
-    likes = stats['likes']
-    dislikes = stats['dislikes']
-    complaints = stats['complaints']
+    ref_stats = await db.get_referral_stats(telegram_id)
 
-    # Оставшееся время премиума
     remaining_time = await db.get_premium_remaining_time(telegram_id)
     has_premium = remaining_time is not None
 
-    # Блок статуса аккаунта
     if has_premium:
         premium_block = (
             "💎 <b>Статус аккаунта:</b>\n"
@@ -1522,36 +1628,124 @@ async def profile_menu(message: Message, state: FSMContext):  # ← добави
             f"⏰ Осталось: <b>{remaining_time}</b>"
         )
     else:
-        premium_block = (
-            "💎 <b>Статус аккаунта:</b>\n"
-            "└ ❌ Обычный аккаунт"
-        )
+        premium_block = "💎 <b>Статус аккаунта:</b>\n└ ❌ Обычный аккаунт"
 
-    # Блок репутации
     reputation_block = (
         "⭐️ <b>Репутация:</b>\n"
-        f"├ 👍 Лайки: <b>{likes}</b>\n"
-        f"├ 👎 Дизлайки: <b>{dislikes}</b>\n"
-        f"└ ⚠️ Нарушения: <b>{complaints}</b>"
+        f"├ 👍 Лайки: <b>{stats['likes']}</b>\n"
+        f"├ 👎 Дизлайки: <b>{stats['dislikes']}</b>\n"
+        f"└ ⚠️ Нарушения: <b>{stats['complaints']}</b>"
+    )
+
+    referral_block = (
+        "\n\n👥 <b>Реферальная система:</b>\n"
+        f"├ 📤 Приглашено: <b>{ref_stats['invited']}</b>\n"
+        f"└ ✅ Зарегистрировалось: <b>{ref_stats['registered']}</b>\n\n"
+        "👇 Приглашай друзей и получай бонусы бесплатно!"
     )
 
     profile_text = (
         f"🆔 <code>{telegram_id}</code>\n\n"
         f"📊 <b>Основная информация:</b>\n"
         f"├ 🚻 Пол: <b>{gender_text}</b>\n"
-        f"└ 🔞 Возраст: <b>{age_text}</b>\n\n"
+        f"└ 🔞 Возраст: <b>{age_text}</b>\n"
         f"{premium_block}\n\n"
         f"{reputation_block}"
+        f"{referral_block}"
     )
 
-    await message.answer(
-        profile_text,
-        parse_mode="HTML",
-        reply_markup=get_profile_keyboard()
-    )
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Пригласить друга", callback_data="show_referral_menu")]
+    ])
 
-    # Теперь state доступен — устанавливаем состояние профиля
+    data = await state.get_data()
+    profile_message_id = data.get("profile_message_id")
+    keyboard_sent = data.get("profile_keyboard_sent", False)
+
+    sent_message = None
+    if profile_message_id:
+        try:
+            sent_message = await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=profile_message_id,
+                text=profile_text,
+                parse_mode="HTML",
+                reply_markup=inline_kb
+            )
+        except Exception as e:
+            # Если не удалось отредактировать — отправляем новое
+            sent_message = await message.answer(
+                profile_text,
+                parse_mode="HTML",
+                reply_markup=inline_kb
+            )
+            profile_message_id = sent_message.message_id
+    else:
+        sent_message = await message.answer(
+            profile_text,
+            parse_mode="HTML",
+            reply_markup=inline_kb
+        )
+        profile_message_id = sent_message.message_id
+
+    # Сохраняем ID сообщения
+    await state.update_data(profile_message_id=profile_message_id)
+
+    # Отправляем клавиатуру ТОЛЬКО если ещё не отправляли
+    if not keyboard_sent:
+        await message.answer("Выберите действие:", reply_markup=get_profile_keyboard())
+        await state.update_data(profile_keyboard_sent=True)
+
     await state.set_state(ProfileState.main)
+
+
+@router.callback_query(F.data == "show_referral_menu")
+async def show_referral_menu(callback: CallbackQuery):
+    """Полное реферальное меню"""
+    telegram_id = callback.from_user.id
+    stats = await db.get_referral_stats(telegram_id)
+
+    bot = await callback.bot.get_me()
+    link = f"https://t.me/{bot.username}?start={telegram_id}"
+
+    text = (
+        "👥 <b>Приглашай друзей</b>\n\n"
+        "💫 <b>Система вознаграждений:</b>\n"
+        "├ 🎁 За каждого друга\n"
+        "└ 💎 <b>+1 час PREMIUM</b>\n\n"
+        "📊 <b>Твоя статистика:</b>\n"
+        f"├ 📤 Приглашено: <b>{stats['invited']}</b>\n"
+        f"├ ✅ Зарегистрировалось: <b>{stats['registered']}</b>\n"
+        f"└ ⏱️ Начислено часов: <b>{stats['hours_granted']}</b>\n\n"
+        f"🔗 <b>Твоя персональная ссылка:</b>\n"
+        f"<code>{link}</code>\n\n"
+        "🚀 Поделись ссылкой и получай бонусы!"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=f"https://t.me/share/url?url={link}")],
+        [InlineKeyboardButton(text="← Назад в профиль", callback_data="referral_back")]
+    ])
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "referral_back")
+async def referral_back(callback: CallbackQuery, state: FSMContext):
+    """Возвращаемся в профиль — редактируем то же сообщение"""
+    # Повторно вызываем логику профиля, но она сама отредактирует сообщение
+    class FakeMessage:
+        bot = callback.bot
+        chat = callback.message.chat
+        from_user = callback.from_user
+
+        async def answer(self, text, **kwargs):
+            await callback.bot.send_message(self.chat.id, text, **kwargs)
+
+    fake_msg = FakeMessage()
+    await profile_menu(fake_msg, state)
+    await callback.answer()
 
 
 # ========== КНОПКИ ПРОФИЛЯ ==========
@@ -1571,14 +1765,13 @@ async def profile_age(message: Message, state: FSMContext):
 
 @router.message(F.text == "← Назад")
 async def profile_back(message: Message, state: FSMContext):
-    """Возврат в главное меню"""
     current_state = await state.get_state()
 
-    if current_state in [ProfileState.main, ProfileState.gender, ProfileState.age]:
-        await state.set_state(ChatState.idle)
-        await message.answer("Возврат в главное меню", reply_markup=get_main_keyboard())
+    if current_state and current_state.startswith("ProfileState"):
+        await state.clear()  # очищаем в т.ч. profile_message_id
+        await message.answer("Главное меню:", reply_markup=get_main_keyboard())
     else:
-        await message.answer("Возврат в главное меню", reply_markup=get_main_keyboard())
+        await message.answer("Главное меню:", reply_markup=get_main_keyboard())
 
 
 # ========== ВЫБОР ПОЛА ==========
@@ -2143,6 +2336,124 @@ async def cmd_give_premium(message: Message):
             await message.answer("Премиум выдан, но пользователь не получит уведомление (не запускал бота).")
     else:
         await message.answer("Не удалось активировать премиум.")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Статистика бота — только для админа"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещён.")
+        return
+
+    async with db.get_connection() as conn:
+        # 1. Общий онлайн — уникальные пользователи в поиске или чате
+        total_online = await conn.fetchval("""
+            SELECT COUNT(DISTINCT telegram_id) FROM (
+                SELECT telegram_id FROM search_queue
+                UNION
+                SELECT telegram_id FROM active_chats
+                UNION
+                SELECT telegram_id FROM group_search_queue
+                UNION
+                SELECT telegram_id FROM group_chat_members
+                WHERE group_id IN (SELECT id FROM group_chats WHERE is_active = TRUE)
+            ) AS online_users
+        """) or 0
+
+        # 2. Разбивка онлайна по полу
+        gender_stats = await conn.fetchrow("""
+            SELECT 
+                COUNT(CASE WHEN u.gender = 'male' THEN 1 END) AS males,
+                COUNT(CASE WHEN u.gender = 'female' THEN 1 END) AS females,
+                COUNT(CASE WHEN u.gender IS NULL THEN 1 END) AS unknown_gender
+            FROM (
+                SELECT DISTINCT telegram_id FROM (
+                    SELECT telegram_id FROM search_queue
+                    UNION
+                    SELECT telegram_id FROM active_chats
+                    UNION
+                    SELECT telegram_id FROM group_search_queue
+                    UNION
+                    SELECT telegram_id FROM group_chat_members
+                    WHERE group_id IN (SELECT id FROM group_chats WHERE is_active = TRUE)
+                ) AS online_users
+            ) AS ou
+            JOIN users u ON u.telegram_id = ou.telegram_id
+        """)
+
+        males_online = gender_stats['males'] or 0
+        females_online = gender_stats['females'] or 0
+        unknown_online = gender_stats['unknown_gender'] or 0
+
+        # 3. Остальная статистика (без изменений)
+        regular_search = await conn.fetchval("""
+            SELECT COUNT(*) FROM search_queue WHERE target_gender IS NULL
+        """)
+
+        gender_search = await conn.fetchval("""
+            SELECT COUNT(*) FROM search_queue WHERE target_gender IS NOT NULL
+        """)
+
+        group_search = await conn.fetchval("""
+            SELECT COUNT(*) FROM group_search_queue
+        """)
+
+        one_on_one = await conn.fetchval("""
+            SELECT COUNT(DISTINCT telegram_id) / 2 FROM active_chats
+        """) or 0
+
+        group_stats = await conn.fetchrow("""
+            SELECT 
+                COUNT(*) AS active_groups,
+                SUM(CASE WHEN member_count = 2 THEN 1 ELSE 0 END) AS groups_of_2,
+                SUM(CASE WHEN member_count = 3 THEN 1 ELSE 0 END) AS groups_of_3,
+                SUM(member_count) AS total_in_groups
+            FROM (
+                SELECT gc.id, COUNT(gcm.telegram_id) AS member_count
+                FROM group_chats gc
+                JOIN group_chat_members gcm ON gc.id = gcm.group_id
+                WHERE gc.is_active = TRUE
+                GROUP BY gc.id
+                HAVING COUNT(gcm.telegram_id) >= 2
+            ) AS sub
+        """)
+
+        active_groups = group_stats['active_groups'] or 0
+        groups_of_2 = group_stats['groups_of_2'] or 0
+        groups_of_3 = group_stats['groups_of_3'] or 0
+        total_in_groups = group_stats['total_in_groups'] or 0
+
+        premium_users = await conn.fetchval("""
+            SELECT COUNT(*) FROM premium
+            WHERE is_active = TRUE AND expires_at > CURRENT_TIMESTAMP
+        """)
+
+    # Формируем красивое сообщение с разбивкой по полу
+    stats_text = (
+        f"📊 <b>Статистика бота (сейчас)</b>\n\n"
+        f"👥 <b>Общий онлайн:</b> <code>{total_online}</code>\n"
+        f"├ 👨 Парни: <code>{males_online}</code>\n"
+        f"├ 👩 Девушки: <code>{females_online}</code>\n"
+        f"└ ❓ Не указали пол: <code>{unknown_online}</code>\n\n"
+
+        f"🔍 <b>В поиске:</b>\n"
+        f"├ Случайный: <code>{regular_search}</code>\n"
+        f"└ По полу: <code>{gender_search}</code>\n\n"
+
+        f"👥 <b>Групповой поиск:</b> <code>{group_search}</code>\n\n"
+
+        f"💬 <b>В чатах:</b>\n"
+        f"├ 1-на-1: <code>{one_on_one * 2}</code> пользователей "
+        f"({one_on_one} пар)\n"
+        f"└ Групповые: <code>{total_in_groups}</code> пользователей "
+        f"в <code>{active_groups}</code> чатах\n"
+        f"   ├ по 2 участника: <code>{groups_of_2}</code>\n"
+        f"   └ по 3 участника: <code>{groups_of_3}</code>\n\n"
+
+        f"💎 <b>Премиум-аккаунтов:</b> <code>{premium_users}</code>"
+    )
+
+    await message.answer(stats_text, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("rating_"))
