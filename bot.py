@@ -629,14 +629,29 @@ class Database:
                             await conn.execute("UPDATE group_chats SET is_active = FALSE WHERE id = $1", group_id)
                             return None
 
-                        if before_count == 2 and after_count == 3:
-                            await bot.send_message(telegram_id,
-                                                   f"👥 Вы присоединились к групповому чату!\n\nУчастников: {after_count}\n\n/leave - Покинуть групповой чат",
-                                                   parse_mode="HTML")
-                            for old in [r['telegram_id'] for r in existing]:
-                                await bot.send_message(old,
-                                                       f"👤 Новый участник присоединился к чату!\n\nТеперь в чате {after_count} участников")
+                        # === УВЕДОМЛЕНИЯ ПРИ ПРИСОЕДИНЕНИИ ===
+                        initiator_id = telegram_id
 
+                        # Новому участнику
+                        await bot.send_message(
+                            initiator_id,
+                            f"👥 Вы присоединились к групповому чату!\n\n"
+                            f"Участников: {after_count}\n\n"
+                            f"/leave - Покинуть групповой чат",
+                            parse_mode="HTML"
+                        )
+
+                        # Существующим участникам — только если стал третий
+                        if before_count == 2 and after_count == 3:
+                            for old in [r['telegram_id'] for r in existing]:
+                                await bot.send_message(
+                                    old,
+                                    f"👤 Новый участник присоединился к чату!\n\n"
+                                    f"Теперь в чате {after_count} участников"
+                                )
+
+                        # ВАЖНО: возвращаем True только для присоединения,
+                        # но уведомления "чат создан" больше не отправляем здесь
                         return after_ids, group_id, True
 
                 # 3. Создание новой группы — с поддержкой постепенного заполнения
@@ -1489,24 +1504,26 @@ async def group_search_menu(message: Message, state: FSMContext):
 
 
 @router.message(GroupSearchState.selecting_mode)
-async def start_group_search(message: Message, state: FSMContext):
+async def group_search_mode_selected(message: Message, state: FSMContext):
+    """Выбор режима группового поиска и запуск поиска"""
+
     if message.text == "← Назад":
-        await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard())
+        await state.clear()
         return
 
-    user_profile = await db.get_user_profile(message.from_user.id)
-    user_gender = user_profile['gender']
+    target_gender = None
+    search_text = ""
 
     # Случайный поиск — доступен всем
     if message.text == "🎲 Случайные собеседники":
         target_gender = None
         search_text = "собеседников"
 
-    # Гендерные варианты
+    # Гендерные варианты — только для премиум
     elif message.text in ["🙋‍♀️ Найти девушек", "🙋‍♂️ Найти парней"]:
-        # === СНАЧАЛА ПРОВЕРЯЕМ ПРЕМИУМ ===
-        if not await db.has_active_premium(message.from_user.id):
+        has_premium = await db.has_active_premium(message.from_user.id)
+        if not has_premium:
             await message.answer(
                 "🍓 <b>Поиск по полу в групповом чате</b> — эксклюзивная премиум-функция!\n\n"
                 "Чтобы создать группу именно с девушками или парнями — активируйте премиум:\n\n"
@@ -1514,9 +1531,11 @@ async def start_group_search(message: Message, state: FSMContext):
                 parse_mode="HTML",
                 reply_markup=get_premium_inline_keyboard()
             )
+            await state.clear()
             return
 
-        # === ТОЛЬКО ЕСЛИ ПРЕМИУМ ЕСТЬ — ПРОВЕРЯЕМ ПОЛ ===
+        user_gender = await db.get_user_gender(message.from_user.id)
+
         if message.text == "🙋‍♀️ Найти девушек":
             if user_gender != "male":
                 await message.answer("❌ Эта опция доступна только парням.")
@@ -1535,7 +1554,7 @@ async def start_group_search(message: Message, state: FSMContext):
         await message.answer("Выберите вариант из меню.")
         return
 
-    # Если дошли сюда — всё ок: либо случайный, либо премиум + правильный пол
+    # Добавляем в очередь и запускаем поиск
     await db.add_to_group_search(message.from_user.id, target_gender)
 
     result = await db.find_group_partner(message.from_user.id, target_gender, message.bot)
@@ -1545,21 +1564,32 @@ async def start_group_search(message: Message, state: FSMContext):
         member_count = len(members)
         initiator_id = message.from_user.id
 
+        # === УВЕДОМЛЕНИЯ ТОЛЬКО ПРИ СОЗДАНИИ НОВОЙ ГРУППЫ ===
+        if not is_joining:
+            create_text = (
+                f"👥 Групповой чат создан!\n\n"
+                f"Участников: {member_count}\n\n"
+                f"/leave - Покинуть групповой чат"
+            )
+            for member in members:
+                try:
+                    await message.bot.send_message(member, create_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления о создании группы {member}: {e}")
+
+        # Устанавливаем состояние "в чате" всем участникам
         for member in members:
             try:
-                if is_joining and member == initiator_id:
-                    continue
-                text = f"👥 Групповой чат создан!\n\nУчастников: {member_count}\n\n/leave - Покинуть групповой чат"
-                await message.bot.send_message(member, text, parse_mode="HTML")
-
                 key = StorageKey(bot_id=message.bot.id, chat_id=member, user_id=member)
                 member_state = FSMContext(storage=state.storage, key=key)
                 await member_state.set_state(ChatState.chatting)
             except Exception as e:
-                logger.error(f"Ошибка обработки участника {member}: {e}")
+                logger.error(f"Ошибка установки состояния участнику {member}: {e}")
 
         await state.set_state(ChatState.chatting)
+
     else:
+        # Никого не нашли — ждём
         await message.answer(
             f"🔍 Ищем {search_text}...\n\n"
             "/leave — остановить поиск",
