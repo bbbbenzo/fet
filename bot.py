@@ -35,6 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_message_id_mapping: dict[Tuple[int, int], dict[int, int]] = {}
+_mapping_lock = asyncio.Lock()
+
 
 # ========== БАЗА ДАННЫХ POSTGRESQL ==========
 class Database:
@@ -1205,6 +1208,29 @@ class Database:
             """, referrer_id, referred_id)
 
             return True
+
+    async def get_partner_message_id(sender_id: int, partner_id: int, sender_message_id: int) -> Optional[int]:
+        """Получить message_id сообщения у партнёра по message_id у отправителя"""
+        key = tuple(sorted([sender_id, partner_id]))
+        async with _mapping_lock:
+            mapping = _message_id_mapping.get(key)
+            if mapping:
+                return mapping.get(sender_message_id)
+        return None
+
+    async def save_message_id_mapping(user1_id: int, user1_msg_id: int, user2_id: int, user2_msg_id: int):
+        """Сохранить соответствие message_id между двумя пользователями"""
+        key = tuple(sorted([user1_id, user2_id]))
+        async with _mapping_lock:
+            mapping = _message_id_mapping.setdefault(key, {})
+            mapping[user1_msg_id] = user2_msg_id
+            mapping[user2_msg_id] = user1_msg_id
+
+    async def clear_chat_mapping(user1_id: int, user2_id: int):
+        """Очистить кэш при завершении чата"""
+        key = tuple(sorted([user1_id, user2_id]))
+        async with _mapping_lock:
+            _message_id_mapping.pop(key, None)
 
 
 # ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ И РОУТЕРА ==========
@@ -2672,49 +2698,111 @@ async def chat_forward(message: Message, state: FSMContext):
         return
 
     try:
-        # Полная пересылка всех типов сообщений в 1-на-1
+        # Если это ответ на сообщение — ищем message_id оригинала у партнёра
+        reply_to_message_id = None
+        if message.reply_to_message:
+            reply_to_message_id = await get_partner_message_id(
+                message.from_user.id, partner_id, message.reply_to_message.message_id
+            )
+
+        # Пересылаем сообщение и сохраняем message_id
+        sent_message = None
+
         if message.text:
-            await message.bot.send_message(partner_id, message.text)
+            sent_message = await message.bot.send_message(
+                partner_id,
+                message.text,
+                entities=message.entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
         elif message.photo:
-            photo = message.photo[-1]
-            await message.bot.send_photo(partner_id, photo.file_id, caption=message.caption)
+            sent_message = await message.bot.send_photo(
+                partner_id,
+                message.photo[-1].file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
         elif message.video:
-            await message.bot.send_video(partner_id, message.video.file_id, caption=message.caption)
-        elif message.video_note:  # кружочек
-            await message.bot.send_video_note(partner_id, message.video_note.file_id)
+            sent_message = await message.bot.send_video(
+                partner_id,
+                message.video.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
+        elif message.video_note:
+            sent_message = await message.bot.send_video_note(partner_id, message.video_note.file_id)
+
         elif message.sticker:
-            await message.bot.send_sticker(partner_id, message.sticker.file_id)
-        elif message.animation:  # GIF / анимированный стикер
-            await message.bot.send_animation(partner_id, message.animation.file_id, caption=message.caption)
+            sent_message = await message.bot.send_sticker(partner_id, message.sticker.file_id)
+
+        elif message.animation:
+            sent_message = await message.bot.send_animation(
+                partner_id,
+                message.animation.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
         elif message.voice:
-            await message.bot.send_voice(partner_id, message.voice.file_id, caption=message.caption)
+            sent_message = await message.bot.send_voice(
+                partner_id,
+                message.voice.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
         elif message.document:
-            await message.bot.send_document(partner_id, message.document.file_id, caption=message.caption)
+            sent_message = await message.bot.send_document(
+                partner_id,
+                message.document.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
         elif message.audio:
-            await message.bot.send_audio(partner_id, message.audio.file_id, caption=message.caption)
-        elif message.location:
-            await message.bot.send_location(partner_id, message.location.latitude, message.location.longitude)
-        elif message.contact:
-            await message.bot.send_contact(partner_id, phone_number=message.contact.phone_number,
-                                           first_name=message.contact.first_name, last_name=message.contact.last_name)
+            sent_message = await message.bot.send_audio(
+                partner_id,
+                message.audio.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_to_message_id=reply_to_message_id
+            )
+
+        # Добавь другие типы по аналогии (location, contact и т.д.)
+
         else:
-            # Если тип не поддерживается — уведомляем
             await message.answer("❌ Этот тип сообщения пока не поддерживается в чате.")
             return
 
-        # Обновляем счётчик сообщений (только для 1-на-1)
+        # Сохраняем соответствие message_id (если сообщение поддерживает reply)
+        if sent_message and message.message_id:
+            await save_message_id_mapping(
+                message.from_user.id, message.message_id,
+                partner_id, sent_message.message_id
+            )
+
+        # Обновляем счётчик
         session_id = await db.get_session(message.from_user.id)
         if session_id:
             async with db.get_connection() as conn:
-                await conn.execute("UPDATE chat_sessions SET message_count = message_count + 1 WHERE id = $1",
-                                   session_id)
+                await conn.execute("UPDATE chat_sessions SET message_count = message_count + 1 WHERE id = $1", session_id)
 
     except Exception as e:
         logger.error(f"Ошибка пересылки в 1-на-1 от {message.from_user.id} к {partner_id}: {e}")
         await db.end_chat(message.from_user.id)
         await state.set_state(ChatState.idle)
         await message.answer(
-            "❌ Собеседник отключился или заблокировал бота.\n\nНачните новый поиск.",
+            "<i>Собеседник отключился или заблокировал бота.</i>\n\n"
+            "<i>Отправьте /search чтобы начать поиск</i>",
+            parse_mode="HTML",
             reply_markup=get_main_keyboard()
         )
 
