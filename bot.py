@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import CallbackQuery
 from datetime import datetime, timedelta, timezone
+from aiogram.types import WebAppInfo
 
 # ========== ЗАГРУЗКА .env ==========
 load_dotenv()
@@ -2466,6 +2467,36 @@ async def cmd_stats(message: Message):
     )
 
     await message.answer(stats_text, parse_mode="HTML")
+
+
+# ========== КОМАНДА /APP — ОТКРЫТИЕ АДМИН-ПАНЕЛИ КАК WEB APP ==========
+@router.message(Command("app"))
+async def cmd_app(message: Message):
+    """Открывает админ-панель как Telegram Web App — только для админа"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещён.")
+        return
+
+    web_app_url = "https://mini-production-e3cc.up.railway.app/"
+
+    # Инлайн-кнопка с Web App
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🌐 Открыть админ-панель",
+            web_app=WebAppInfo(url=web_app_url)
+        )]
+    ])
+
+    await message.answer(
+        "🔧 <b>Админ-панель бота</b>\n\n"
+        "• Статистика в реальном времени\n"
+        "• График роста пользователей\n"
+        "• Онлайн, активные чаты, премиум\n"
+        "• Автообновление каждые 30 секунд\n\n"
+        "<i>Нажмите кнопку ниже — панель откроется в полноэкранном режиме внутри Telegram:</i>",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("rating_"))
