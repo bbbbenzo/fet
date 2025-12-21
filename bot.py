@@ -2371,117 +2371,98 @@ async def cmd_give_premium(message: Message):
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    """Статистика бота — только для админа"""
+    """Статистика бота — всего пользователей + новые за 24ч"""
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Доступ запрещён.")
         return
 
+    # ИСПРАВЛЕНО: убираем tzinfo, чтобы asyncpg не ругался
+    twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).replace(tzinfo=None)
+
     async with db.get_connection() as conn:
-        # 1. Общий онлайн — уникальные пользователи в поиске или чате
-        total_online = await conn.fetchval("""
-            SELECT COUNT(DISTINCT telegram_id) FROM (
-                SELECT telegram_id FROM search_queue
-                UNION
-                SELECT telegram_id FROM active_chats
-                UNION
-                SELECT telegram_id FROM group_search_queue
-                UNION
-                SELECT telegram_id FROM group_chat_members
-                WHERE group_id IN (SELECT id FROM group_chats WHERE is_active = TRUE)
-            ) AS online_users
-        """) or 0
+        # === Общее количество пользователей ===
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+        new_users = await conn.fetchval("""
+            SELECT COUNT(*) FROM users 
+            WHERE created_at >= $1
+        """, twenty_four_hours_ago) or 0
 
-        # 2. Разбивка онлайна по полу
-        gender_stats = await conn.fetchrow("""
-            SELECT 
-                COUNT(CASE WHEN u.gender = 'male' THEN 1 END) AS males,
-                COUNT(CASE WHEN u.gender = 'female' THEN 1 END) AS females,
-                COUNT(CASE WHEN u.gender IS NULL THEN 1 END) AS unknown_gender
-            FROM (
-                SELECT DISTINCT telegram_id FROM (
-                    SELECT telegram_id FROM search_queue
-                    UNION
-                    SELECT telegram_id FROM active_chats
-                    UNION
-                    SELECT telegram_id FROM group_search_queue
-                    UNION
-                    SELECT telegram_id FROM group_chat_members
-                    WHERE group_id IN (SELECT id FROM group_chats WHERE is_active = TRUE)
-                ) AS online_users
-            ) AS ou
-            JOIN users u ON u.telegram_id = ou.telegram_id
+        # === Разбивка по полу (общая + новые за 24ч) ===
+        gender_stats = await conn.fetch("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN created_at >= $1 THEN 1 END) AS new_24h,
+                COALESCE(gender, 'unknown') AS gender
+            FROM users
+            GROUP BY COALESCE(gender, 'unknown')
+        """, twenty_four_hours_ago)
+
+        # Инициализация
+        males_total = males_new = females_total = females_new = unknown_total = unknown_new = 0
+
+        for row in gender_stats:
+            g = row['gender']
+            if g == 'male':
+                males_total = row['total']
+                males_new = row['new_24h']
+            elif g == 'female':
+                females_total = row['total']
+                females_new = row['new_24h']
+            else:
+                unknown_total = row['total']
+                unknown_new = row['new_24h']
+
+        # === Остальные метрики (без изменений) ===
+        regular_search = await conn.fetchval("SELECT COUNT(*) FROM search_queue WHERE target_gender IS NULL") or 0
+        gender_search = await conn.fetchval("SELECT COUNT(*) FROM search_queue WHERE target_gender IS NOT NULL") or 0
+        group_search = await conn.fetchval("SELECT COUNT(*) FROM group_search_queue") or 0
+
+        active_chats_count = await conn.fetchval("SELECT COUNT(*) FROM active_chats") or 0
+        one_on_one_pairs = active_chats_count // 2
+
+        active_groups_data = await conn.fetch("""
+            SELECT COUNT(gcm.telegram_id) AS members
+            FROM group_chats gc
+            JOIN group_chat_members gcm ON gc.id = gcm.group_id
+            WHERE gc.is_active = TRUE
+            GROUP BY gc.id
+            HAVING COUNT(gcm.telegram_id) >= 2
         """)
 
-        males_online = gender_stats['males'] or 0
-        females_online = gender_stats['females'] or 0
-        unknown_online = gender_stats['unknown_gender'] or 0
-
-        # 3. Остальная статистика (без изменений)
-        regular_search = await conn.fetchval("""
-            SELECT COUNT(*) FROM search_queue WHERE target_gender IS NULL
-        """)
-
-        gender_search = await conn.fetchval("""
-            SELECT COUNT(*) FROM search_queue WHERE target_gender IS NOT NULL
-        """)
-
-        group_search = await conn.fetchval("""
-            SELECT COUNT(*) FROM group_search_queue
-        """)
-
-        one_on_one = await conn.fetchval("""
-            SELECT COUNT(DISTINCT telegram_id) / 2 FROM active_chats
-        """) or 0
-
-        group_stats = await conn.fetchrow("""
-            SELECT 
-                COUNT(*) AS active_groups,
-                SUM(CASE WHEN member_count = 2 THEN 1 ELSE 0 END) AS groups_of_2,
-                SUM(CASE WHEN member_count = 3 THEN 1 ELSE 0 END) AS groups_of_3,
-                SUM(member_count) AS total_in_groups
-            FROM (
-                SELECT gc.id, COUNT(gcm.telegram_id) AS member_count
-                FROM group_chats gc
-                JOIN group_chat_members gcm ON gc.id = gcm.group_id
-                WHERE gc.is_active = TRUE
-                GROUP BY gc.id
-                HAVING COUNT(gcm.telegram_id) >= 2
-            ) AS sub
-        """)
-
-        active_groups = group_stats['active_groups'] or 0
-        groups_of_2 = group_stats['groups_of_2'] or 0
-        groups_of_3 = group_stats['groups_of_3'] or 0
-        total_in_groups = group_stats['total_in_groups'] or 0
+        active_groups = len(active_groups_data)
+        total_in_groups = sum(row['members'] for row in active_groups_data)
+        groups_of_2 = sum(1 for row in active_groups_data if row['members'] == 2)
+        groups_of_3 = sum(1 for row in active_groups_data if row['members'] == 3)
 
         premium_users = await conn.fetchval("""
             SELECT COUNT(*) FROM premium
             WHERE is_active = TRUE AND expires_at > CURRENT_TIMESTAMP
-        """)
+        """) or 0
 
-    # Формируем красивое сообщение с разбивкой по полу
+    # === Сообщение ===
     stats_text = (
-        f"📊 <b>Статистика бота (сейчас)</b>\n\n"
-        f"👥 <b>Общий онлайн:</b> <code>{total_online}</code>\n"
-        f"├ 👨 Парни: <code>{males_online}</code>\n"
-        f"├ 👩 Девушки: <code>{females_online}</code>\n"
-        f"└ ❓ Не указали пол: <code>{unknown_online}</code>\n\n"
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 <b>Всего пользователей:</b> <code>{total_users}</code> "
+        f"(<code>+{new_users}</code>)\n"
+        f"├ 🙋‍♂️ Парни: <code>{males_total}</code> (<code>+{males_new}</code>)\n"
+        f"├ 🙋‍♀️ Девушки: <code>{females_total}</code> (<code>+{females_new}</code>)\n"
+        f"└ ❓ Не указали пол: <code>{unknown_total}</code> (<code>+{unknown_new}</code>)\n\n"
 
-        f"🔍 <b>В поиске:</b>\n"
+        f"🔍 <b>Сейчас в поиске 1-на-1:</b>\n"
         f"├ Случайный: <code>{regular_search}</code>\n"
         f"└ По полу: <code>{gender_search}</code>\n\n"
 
         f"👥 <b>Групповой поиск:</b> <code>{group_search}</code>\n\n"
 
-        f"💬 <b>В чатах:</b>\n"
-        f"├ 1-на-1: <code>{one_on_one * 2}</code> пользователей "
-        f"({one_on_one} пар)\n"
+        f"💬 <b>Активные чаты:</b>\n"
+        f"├ 1-на-1: <code>{active_chats_count}</code> пользователей "
+        f"(<code>{one_on_one_pairs}</code> пар)\n"
         f"└ Групповые: <code>{total_in_groups}</code> пользователей "
         f"в <code>{active_groups}</code> чатах\n"
-        f"   ├ по 2 участника: <code>{groups_of_2}</code>\n"
-        f"   └ по 3 участника: <code>{groups_of_3}</code>\n\n"
+        f"   ├ По 2: <code>{groups_of_2}</code>\n"
+        f"   └ По 3: <code>{groups_of_3}</code>\n\n"
 
-        f"💎 <b>Премиум-аккаунтов:</b> <code>{premium_users}</code>"
+        f"💎 <b>Активных премиум:</b> <code>{premium_users}</code>"
     )
 
     await message.answer(stats_text, parse_mode="HTML")
